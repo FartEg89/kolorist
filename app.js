@@ -111,7 +111,7 @@ document.addEventListener('visibilitychange',()=>{if (document.visibilityState==
 window.addEventListener('pagehide',()=>{if(nextDraft) flushDraft();});
 function freshDraft() {
   const p=state.preferences;
-  return {...blankVisit(),amount:p.defaultAmount||'',type:p.defaultType,target:p.defaultTarget};
+  return {...blankVisit(),work:p.defaultWork,amount:p.defaultAmount||'',type:p.defaultType,target:p.defaultTarget};
 }
 function setDraft(next) {
   draft=next;
@@ -147,11 +147,63 @@ function chooseClient() {
   show('Кто пришёл?',box('div','stack',label('Найти клиента',search),
     actions(b('Без клиента',()=>setPerson(null)),b('Новый клиент',()=>clientForm(null,true),'primary')),results));
 }
+function redrawInPlace() {
+  const offset=root.scrollTop;
+  dialog.close();
+  render();
+  root.scrollTop=offset;
+}
+
+function groupStepForm() {
+  const preferences=state.preferences;
+  const controls=Object.entries(stepKeys).map(([unit,key])=>{
+    const field=input(key,quantityFormat.format(preferences[key]).replace(/\s/g,''),{inputMode:'decimal',required:true,maxLength:12});
+    return [unit,key,field];
+  });
+  show('Шаги расходников',dim('Это прибавка или убавка за одно нажатие. Например, шаг 5 г превращает 8 г в 13 г. Поле количества принимает любое точное значение.'),
+    form(async fields=>{
+      const steps=Object.fromEntries(controls.map(([,key])=>[key,stepValue(fields[key])]));
+      await write(data=>({...data,preferences:{...data.preferences,...steps}}));
+      redrawInPlace();
+      notify('Шаги групп сохранены');
+    },'Сохранить шаги',...controls.map(([unit,,field])=>label(units[unit]+' ('+unit+')',field)),
+    b('Подставить 5 г, 1 дозу, 1 шт.',()=>{
+      const defaults=defaultPreferences();
+      for (const [,key,field] of controls) field.value=defaults[key];
+    })));
+}
+
+function itemStepForm(row) {
+  const current=state.materials.find(item=>item.id===row.id);
+  if (!current) return;
+  const field=input('step',current.step??'',{inputMode:'decimal',maxLength:12});
+  const save=async value=>{
+    await write(data=>({...data,revised:true,materials:data.materials.map(item=>{
+      if (item.id!==current.id) return item;
+      const updated={...item};
+      if (value) updated.step=value;
+      else delete updated.step;
+      return updated;
+    })}));
+    redrawInPlace();
+    notify(value?'Свой шаг сохранён':'Включён шаг группы');
+  };
+  show('Шаг: '+current.name,dim('Шаг группы — '+quantityFormat.format(state.preferences[stepKeys[current.unit]])+' '+current.unit+'.'),
+    form(fields=>save(fields.step.trim()?stepValue(fields.step):0),
+      'Сохранить шаг',label('Свой шаг, '+current.unit,field),b('Использовать шаг группы',()=>save(0))));
+}
+
 function materialList(output) {
   const result=box('div','stack');
   const active=new Map(state.materials.filter(row=>row.active).map(row=>[row.id,row]));
+  const catalog=new Map(state.materials.map(row=>[row.id,row]));
+  const rowsByGroup=[];
+  const search=input('material-query','',{type:'search',placeholder:'Название или описание'});
+  const filter=choose('material-visit-filter',state.preferences.visitMaterialFilter,[['all','Все расходники'],['favorites','Избранное и введённые']]);
+  const noMatches=dim('Подходящих расходников нет.');
+  noMatches.hidden=true;
   for (const snap of draft.original) {
-    active.set(snap.id,draft.refresh?(state.materials.find(row=>row.id===snap.id)||snap):snap);
+    active.set(snap.id,draft.refresh?(catalog.get(snap.id)||snap):snap);
   }
   for (const [unit,name] of Object.entries(units)) {
     const rows=[...active.values()].filter(row=>row.unit===unit).sort(materialOrder);
@@ -164,9 +216,12 @@ function materialList(output) {
     };
     const summary=()=>overview().join(' · ');
     const items=box('div','stack');
+    const entries=[];
     let group;
     for (const row of rows) {
-      const field=input('qty',Object.hasOwn(draft.qty,row.id)?draft.qty[row.id]:'',{inputMode:'decimal',placeholder:'0'});
+      const current=catalog.get(row.id);
+      const effectiveStep=materialStep(current||row);
+      const field=input('qty',Object.hasOwn(draft.qty,row.id)?draft.qty[row.id]:'',{inputMode:'decimal',placeholder:'0',maxLength:16});
       field.setAttribute('aria-label',row.name+', количество');
       const update=()=>{
         if (field.value.trim()) draft.qty[row.id]=field.value;
@@ -177,18 +232,50 @@ function materialList(output) {
       };
       field.oninput=update;
       const step=sign=>{
-        const next=fixed(field.value,'Количество',100000,3)+sign*fixed(materialStep(row),'Шаг',10000,3);
+        const next=fixed(field.value,'Количество',100000,3)+sign*fixed(effectiveStep,'Шаг',10000,3);
         field.value=Math.min(100000000,Math.max(0,next))/1000;
         update();
       };
       const minus=b('−',()=>step(-1)),plus=b('+',()=>step(1));
       minus.setAttribute('aria-label','Уменьшить количество: '+row.name);
       plus.setAttribute('aria-label','Увеличить количество: '+row.name);
-      items.append(box('div','item',box('div','',el('strong',row.name),dim([row.description,unitPrice(row.retail)+' за 1 '+unit].filter(Boolean).join(' · '))),box('div','qty',minus,field,plus)));
+      const stepLabel='Шаг '+quantityFormat.format(effectiveStep)+' '+unit;
+      const stepControl=current?b(stepLabel,()=>itemStepForm(current),'step-link'):dim(stepLabel);
+      if (current) stepControl.setAttribute('aria-label','Изменить шаг: '+row.name);
+      const prices=unitPrice(row.retail)+' клиенту за 1 '+unit
+        +(state.preferences.showMaterialCost?' · '+unitPrice(row.cost)+' закупка':'');
+      const card=box('div','item',box('div','item-description',el('strong',(current?.favorite?'★ ':'')+row.name),
+        dim([row.description,prices].filter(Boolean).join(' · '))),box('div','item-controls',box('div','qty',minus,field,plus),stepControl));
+      items.append(card);
+      entries.push({card,field,row,favorite:current?.favorite});
     }
     group=details(summary(),items,visitLists.has(unit)||overview()[0]!==name||state.preferences.expandMaterials);
     group.ontoggle=()=>group.open?visitLists.add(unit):visitLists.delete(unit);
+    rowsByGroup.push({group,entries});
     result.append(group);
+  }
+  if (rowsByGroup.length) {
+    const applyFilter=()=>{
+      const query=search.value.trim().toLocaleLowerCase('ru');
+      let matched=false;
+      for (const {group,entries} of rowsByGroup) {
+        let visible=false;
+        for (const {card,field,row,favorite} of entries) {
+          const chosen=Boolean(field.value.trim());
+          card.hidden=(!chosen && filter.value==='favorites' && !favorite)
+            || (!chosen && query && !(row.name+' '+(row.description||'')).toLocaleLowerCase('ru').includes(query));
+          if (!card.hidden) visible=true;
+        }
+        group.hidden=!visible;
+        if (visible && (query || filter.value==='favorites')) group.open=true;
+        matched||=visible;
+      }
+      noMatches.hidden=matched;
+    };
+    search.oninput=applyFilter;
+    filter.onchange=applyFilter;
+    result.prepend(box('div','duo',label('Поиск',search),label('Показать',filter)),noMatches);
+    applyFilter();
   }
   for (const id of Object.keys(draft.qty).filter(id=>!active.has(id))) result.append(b('Убрать недоступный расходник',()=>{
     delete draft.qty[id];
@@ -210,7 +297,7 @@ function hasDraft() {
   const p=state.preferences;
   const discountChanged=String(draft.amount||'')!==String(p.defaultAmount||'')
     || draft.type!==p.defaultType || draft.target!==p.defaultTarget;
-  return Boolean(draft.editing||draft.client||draft.work||draft.recipe||draft.note||discountChanged||Object.keys(draft.qty).length);
+  return Boolean(draft.editing||draft.client||String(draft.work??'')!==p.defaultWork||draft.recipe||draft.note||discountChanged||Object.keys(draft.qty).length);
 }
 function historyToDraft(row,person,withMaterials) {
   const open=()=>{
@@ -222,8 +309,10 @@ function historyToDraft(row,person,withMaterials) {
     dialog.close();
     setDraft(next);
   };
-  const emptyForClient=!draft.editing && draft.client===person.id && !draft.work && !draft.recipe && !draft.note && !Object.keys(draft.qty).length &&
-    (!draft.amount || (person.benefit && Number(draft.amount)===person.amount && draft.type===person.type && draft.target===person.target));
+  const expectedDiscount=person.benefit?discount(person):discount(freshDraft());
+  const matchesDiscount=Number(draft.amount||0)===expectedDiscount.amount && draft.type===expectedDiscount.type && draft.target===expectedDiscount.target;
+  const emptyForClient=!draft.editing && draft.client===person.id && String(draft.work??'')===state.preferences.defaultWork
+    && !draft.recipe && !draft.note && !Object.keys(draft.qty).length && matchesDiscount;
   if (hasDraft() && !emptyForClient) confirm('Заполнить новый визит?','Текущий черновик будет заменён.',open,'Заполнить');
   else open();
 }
@@ -265,8 +354,9 @@ function visitPage() {
   };
   const amounts=box('aside','bill',box('div','summary',el('strong','Итог чека'),amount),box('div','row',fund,net),saving,error);
   const recipes=details('Формула окрашивания и заметка',box('div','stack',label('Формула',recipe),label('Заметка',note)),Boolean(draft.recipe||draft.note||state.preferences.expandRecipe));
-  const discounts=details('Скидка',discountFields(draft),Boolean(draft.amount));
-  const materials=box('div','stack',el('h2','Расходники'),materialList(update));
+  const discounts=details('Скидка',discountFields(draft),Boolean(draft.amount)||state.preferences.expandDiscount);
+  const materials=box('div','stack',box('div','head',el('h2','Расходники'),b('Шаги +/−',groupStepForm)),
+    dim('Количество можно ввести вручную, например 8,5 г.'),materialList(update));
   if (draft.editing && draft.original.length) materials.append(b(draft.refresh?'Вернуть цены визита':'Обновить цены в этом визите',()=>{
     const apply=()=>{draft.refresh=!draft.refresh;remember();dialog.close();render();};
     if (draft.refresh) apply();
@@ -452,7 +542,8 @@ function purchasesPage() {
   return box('section','',box('div','head',el('h1','Закупки'),b('Добавить',()=>purchaseForm(),'primary')),list);
 }
 function materialForm(existing) {
-  const row=existing||{id:uid(),name:'',unit:'г',cost:'',retail:'',active:true};
+  const maxOrder=state.materials.reduce((max,item)=>Math.max(max,item.order||0),0);
+  const row=existing||{id:uid(),name:'',unit:'г',cost:'',retail:'',active:true,order:Math.min(100000,maxOrder+1)};
   const cost=input('cost',row.cost,{inputMode:'decimal'});
   const retail=input('retail',row.retail,{inputMode:'decimal'});
   const capacity=input('pack-size','',{inputMode:'decimal'});
@@ -467,10 +558,11 @@ function materialForm(existing) {
   const favorite=input('favorite','on',{type:'checkbox',checked:row.favorite===true});
   const save=form(async fields=>{
     requireThat(fields.name.trim(),'Укажите название расходника.');
-    const step=fixed(fields.step,'Шаг',10000,3)/1000;
-    requireThat(!fields.step.trim() || step>0,'Укажите шаг больше нуля или оставьте поле пустым.');
+    const step=fields.step.trim()?stepValue(fields.step):0;
+    const order=Number(fields.order);
+    requireThat(Number.isInteger(order) && order>=0 && order<=100000,'Укажите целое число от 0 до 100 000.');
     const record={...row,name:fields.name.trim(),unit:unit.value,cost:price(fields.cost,'Цена закупки'),
-      retail:price(fields.retail,'Цена клиенту'),description:fields.description.trim(),favorite:fields.favorite==='on'};
+      retail:price(fields.retail,'Цена клиенту'),description:fields.description.trim(),favorite:fields.favorite==='on',order};
     if (step>0) record.step=step;
     else delete record.step;
     await write(data=>({...data,materials:existing?data.materials.map(m=>m.id===row.id?record:m):data.materials.concat(record),revised:true}));
@@ -480,7 +572,9 @@ function materialForm(existing) {
   },'Сохранить цены',label('Название',input('name',row.name,{required:true,maxLength:120})),label('Единица измерения',unit),
   label('Закупка за единицу, ₽',cost),label('Клиенту за единицу, ₽',retail),
   label('Краткое описание',input('description',row.description,{maxLength:160,placeholder:'Например, оттенок 7.1'})),
-  label('Свой шаг +/−',input('step',row.step,{inputMode:'decimal',placeholder:'По группе'})),label('В избранное',favorite),calc);
+  label('Свой шаг +/−',input('step',row.step,{inputMode:'decimal',placeholder:'По группе'})),
+  label('Позиция в списке',input('order',row.order??0,{inputMode:'numeric',maxLength:6,required:true})),dim('Меньшее число показывает расходник выше при своей сортировке.'),
+  label('В избранное',favorite),calc);
   const toggle=async ()=>{
     await write(data=>({...data,materials:data.materials.map(m=>m.id===row.id?{...m,active:!m.active}:m)}));
     dialog.close();
@@ -493,7 +587,7 @@ function materialForm(existing) {
 }
 function materialOrder(a,b) {
   return Number(b.active===true)-Number(a.active===true) || Number(b.favorite===true)-Number(a.favorite===true)
-    || (a.order||0)-(b.order||0);
+    || (state.preferences.materialSort==='name'?a.name.localeCompare(b.name,'ru'):(a.order||0)-(b.order||0));
 }
 function materialStep(row) {return row.step || state.preferences[stepKeys[row.unit]];}
 function materialsPage() {
@@ -501,9 +595,13 @@ function materialsPage() {
   const list=box('div','stack');
   const query=input('search','',{type:'search',placeholder:'Название или описание'});
   const favorites=input('favorites','on',{type:'checkbox'});
+  const group=choose('catalog-group','all',[['all','Все группы'],...Object.entries(units)]);
+  const availability=choose('catalog-active','all',[['all','Все'],['active','Рабочие'],['archive','Архив']]);
   const refresh=()=>{
     const text=query.value.trim().toLocaleLowerCase('ru');
     const rows=state.materials.filter(row=>(!favorites.checked || row.favorite) &&
+      (group.value==='all' || row.unit===group.value) &&
+      (availability.value==='all' || row.active===(availability.value==='active')) &&
       (row.name+' '+(row.description||'')).toLocaleLowerCase('ru').includes(text)).sort(materialOrder);
     list.replaceChildren();
     if (!rows.length) list.append(dim('Подходящих расходников нет.'));
@@ -515,9 +613,11 @@ function materialsPage() {
   };
   query.oninput=refresh;
   favorites.onchange=refresh;
+  group.onchange=availability.onchange=refresh;
   refresh();
   return box('section','',head,dim('Начальные цены примерные. Укажите свои перед первой записью.'),
-    label('Поиск расходников',query),label('Только избранное',favorites),list);
+    label('Поиск расходников',query),box('div','duo',label('Группа',group),label('Статус',availability)),
+    label('Только избранное',favorites),b('Шаги +/−',groupStepForm),list);
 }
 function restoreDocument(json) {
   let parsed;
@@ -530,6 +630,7 @@ function restoreDocument(json) {
       applyPreferences();
       draft=freshDraft();
       reportDate=today();
+      reportMode=state.preferences.reportMode;
       dialog.close();
       render();
       notify('Записи восстановлены.');
@@ -542,10 +643,11 @@ async function checkBackupReminder() {
   checkingBackupReminder=true;
   try {
     const hasRecords=Boolean(state.visits.length || state.clients.length || state.purchases.length || state.revised);
-    if (await claimBackupReminder(hasRecords) && !dialog.open && document.visibilityState!=='hidden') {
+    const days=state.preferences.backupDays;
+    if (await claimBackupReminder(hasRecords,days) && !dialog.open && document.visibilityState!=='hidden') {
       show('Пора создать резервную копию',
         dim('Сохраните зашифрованную копию вне телефона, чтобы вернуть записи после очистки или потери устройства.'),
-        actions(b('Через три дня',()=>dialog.close()),b('Создать копию',exportBackup,'primary')));
+        actions(b(days===3?'Через три дня':'Отложить',()=>dialog.close()),b('Создать копию',exportBackup,'primary')));
     }
   } catch(error) {
     // Если отметку не удалось сохранить, кабинет остаётся доступен.
@@ -553,7 +655,7 @@ async function checkBackupReminder() {
 }
 
 async function confirmBackupSaved() {
-  await postponeBackupReminder().catch(()=>{});
+  await postponeBackupReminder(state.preferences.backupDays).catch(()=>{});
   dialog.close();
   notify('Защищённая копия сохранена.');
 }
@@ -637,25 +739,40 @@ function settingsPage() {
   if (!timeZones.has(p.zone)) timeZones.set(p.zone,p.zone);
   const openMaterials=input('expandMaterials','on',{type:'checkbox',checked:p.expandMaterials});
   const openRecipe=input('expandRecipe','on',{type:'checkbox',checked:p.expandRecipe});
-  return box('section','',el('h1','Настройки'),panel(form(async fields=>{
-    const preferences=preferencesFrom({...p,...fields,expandMaterials:openMaterials.checked,expandRecipe:openRecipe.checked,
+  const openDiscount=input('expandDiscount','on',{type:'checkbox',checked:p.expandDiscount});
+  const materialCost=input('showMaterialCost','on',{type:'checkbox',checked:p.showMaterialCost});
+  return box('section','',el('h1','Настройки'),form(async fields=>{
+    const previous=state.preferences;
+    const preferences=preferencesFrom({...previous,...fields,expandMaterials:openMaterials.checked,expandRecipe:openRecipe.checked,
+      expandDiscount:openDiscount.checked,showMaterialCost:materialCost.checked,
       defaultAmount:fields.amount,defaultType:fields.type,defaultTarget:fields.target});
     const idle=!hasDraft();
     await flushDraft().catch(()=>{});
     await write(data=>({...data,preferences}),idle);
     applyPreferences();
     reportDate=today();
+    if (previous.reportMode!==preferences.reportMode) reportMode=preferences.reportMode;
+    if (previous.backupDays!==preferences.backupDays) await postponeBackupReminder(preferences.backupDays).catch(()=>{});
     if (idle) draft=freshDraft();
     notify('Настройки сохранены.');
-  },'Сохранить',label('Название кабинета',input('name',p.name,{maxLength:60,required:true})),
-    label('Часовой пояс',choose('zone',p.zone,timeZones)),label('Тема',theme),
-    ...Object.entries(stepKeys).map(([unit,key])=>label('Шаг +/−, '+unit,input(key,p[key],{inputMode:'decimal',required:true}))),
-    el('h2','Скидка по умолчанию'),discountFields({amount:p.defaultAmount,type:p.defaultType,target:p.defaultTarget}),
-    label('Раскрывать расходники в новом визите',openMaterials),label('Раскрывать формулу в новом визите',openRecipe))));
+  },'Сохранить настройки',
+  panel(el('h2','Кабинет'),label('Название кабинета',input('name',p.name,{maxLength:60,required:true})),
+    label('Часовой пояс',choose('zone',p.zone,timeZones)),label('Тема',theme)),
+  panel(el('h2','Шаги и расходники'),dim('Свой шаг одного материала можно задать прямо в визите или в его карточке.'),
+    box('div','duo',...Object.entries(stepKeys).map(([unit,key])=>label('Шаг +/−, '+unit,input(key,p[key],{inputMode:'decimal',required:true,maxLength:12})))),
+    label('По умолчанию в визите',choose('visitMaterialFilter',p.visitMaterialFilter,[['all','Все расходники'],['favorites','Избранное и введённые']])),
+    label('Сортировка',choose('materialSort',p.materialSort,[['order','По заданной позиции'],['name','По алфавиту']])),
+    label('Показывать закупочную цену в визите',materialCost)),
+  panel(el('h2','Новый визит'),label('Стоимость работы по умолчанию, ₽',input('defaultWork',p.defaultWork,{inputMode:'decimal',maxLength:16,placeholder:'Без подстановки'})),
+    el('h3','Скидка по умолчанию'),discountFields({amount:p.defaultAmount,type:p.defaultType,target:p.defaultTarget}),
+    label('Раскрывать расходники',openMaterials),label('Раскрывать формулу',openRecipe),label('Раскрывать скидку',openDiscount)),
+  panel(el('h2','Итоги и копии'),
+    label('Период при открытии',choose('reportMode',p.reportMode,[['day','День'],['month','Месяц']])),
+    label('Напоминать о копии',choose('backupDays',p.backupDays,[[3,'Раз в 3 дня'],[7,'Раз в неделю'],[14,'Раз в 2 недели'],[0,'Не напоминать']])))));
 }
 function tour(step=0) {
   const steps=[
-    ['Запишите визит','Укажите стоимость работы и точное количество материалов. Например, 8,5 г можно ввести вручную.'],
+    ['Запишите визит','Введите точное количество, например 8,5 г. Кнопка «Шаги +/−» задаёт прибавку для граммов, доз и штук. Нажмите на шаг рядом с материалом, чтобы задать ему своё значение.'],
     ['Сохраните формулу','В карточке клиента хранятся контакты, скидка и история окрашиваний.'],
     ['Сверьте итоги','В «Итогах» видны касса, фонд закупки и чистый заработок. Создать копию с паролем можно в разделе «Ещё».']
   ];
@@ -667,7 +784,8 @@ function tour(step=0) {
 function morePage() {
   return box('section','',el('h1','Ещё'),panel(
     b('Закупки',()=>jump('purchases')),b('Расходники и цены',()=>jump('materials')),
-    b('Настройки',()=>jump('settings')),b('Резервная копия',()=>jump('backup')),b('Посмотреть обучение',()=>tour()),
+    b('Шаги +/−',groupStepForm),b('Настройки',()=>jump('settings')),
+    b('Резервная копия',()=>jump('backup')),b('Посмотреть обучение',()=>tour()),
     ...(!inAPK && !matchMedia('(display-mode: standalone)').matches && !navigator.standalone?
       [b('Установить на телефон',installApp)]:[])),
     dim('Записи остаются на этом устройстве. Часовой пояс: '+state.preferences.zone+'.'));
@@ -690,6 +808,7 @@ async function openCabinet() {
   state=await read();
   applyPreferences();
   reportDate=today();
+  reportMode=state.preferences.reportMode;
   draft=state.draft||freshDraft();
   const storedVisit=state.visits.find(row=>row.id===draft.id);
   if (draft.editing===true) {

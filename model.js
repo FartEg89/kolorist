@@ -19,9 +19,16 @@ const ruDate = new Intl.DateTimeFormat('ru-RU',{day:'numeric',month:'long',year:
 let cabinetZone = TZ;
 function defaultPreferences() {
   return {zone:TZ,name:'Кабинет колориста',theme:'system',step_g:5,step_dose:1,step_piece:1,
-    defaultAmount:0,defaultType:'%',defaultTarget:'работа',expandMaterials:false,expandRecipe:false};
+    defaultAmount:0,defaultType:'%',defaultTarget:'работа',defaultWork:'',
+    expandMaterials:false,expandRecipe:false,expandDiscount:false,
+    visitMaterialFilter:'all',showMaterialCost:false,materialSort:'order',reportMode:'day',backupDays:3};
 }
 const stepKeys={'г':'step_g','доза':'step_dose','шт':'step_piece'};
+function stepValue(value) {
+  const step=fixed(value,'Шаг',10000,3)/1000;
+  requireThat(step>0,'Введите шаг больше нуля, например 5 или 0,5.');
+  return step;
+}
 function preferencesFrom(raw={}) {
   const p={...defaultPreferences(),...raw};
   const result=defaultPreferences();
@@ -32,13 +39,16 @@ function preferencesFrom(raw={}) {
   result.zone=p.zone;
   requireThat(['system','light','dark'].includes(p.theme),'В копии неверная тема.');
   result.theme=p.theme;
-  for (const key of Object.values(stepKeys)) {
-    result[key]=fixed(p[key],'Шаг',10000,3)/1000;
-    requireThat(result[key]>0,'Шаг должен быть больше нуля.');
-  }
+  for (const key of Object.values(stepKeys)) result[key]=stepValue(p[key]);
   const rule=discount({amount:p.defaultAmount,type:p.defaultType,target:p.defaultTarget});
+  const defaultWork=String(p.defaultWork??'').trim()?String(fixed(p.defaultWork,'Стоимость работы',10000000)/100):'';
+  const backupDays=Number(p.backupDays);
   return Object.assign(result,{defaultAmount:rule.amount,defaultType:rule.type,defaultTarget:rule.target,
-    expandMaterials:p.expandMaterials===true,expandRecipe:p.expandRecipe===true});
+    defaultWork,expandMaterials:p.expandMaterials===true,expandRecipe:p.expandRecipe===true,
+    expandDiscount:p.expandDiscount===true,showMaterialCost:p.showMaterialCost===true,
+    visitMaterialFilter:p.visitMaterialFilter==='favorites'?'favorites':'all',
+    materialSort:p.materialSort==='name'?'name':'order',reportMode:p.reportMode==='month'?'month':'day',
+    backupDays:[0,3,7,14].includes(backupDays)?backupDays:3});
 }
 const money = value => rubles.format(value/100) + ' ₽';
 const unitPrice = value => prices.format(value) + ' ₽';

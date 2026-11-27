@@ -69,3 +69,8 @@ body.keyboard #visit-dock,body.native-keyboard #visit-dock{display:none}
   .bill{padding:5px 9px;gap:2px}
   .bill .amount{font-size:1.25rem}
 }
+
+.item-description{min-width:0;flex:1 1 145px}
+.item-controls{display:grid;justify-items:end;gap:4px;margin-left:auto;max-width:100%}
+.step-link{color:var(--accent);border-color:var(--line);font-size:.875rem;padding:6px 10px}
+@media(max-width:380px){.item-controls{justify-items:start;margin-left:0;width:100%}}
