@@ -82,6 +82,8 @@ function show(title,...items) {
   $('dialog-title').textContent=title;
   body.replaceChildren(...items);
   if (!dialog.open) dialog.showModal();
+  dialog.scrollTop=0;
+  body.scrollTop=0;
 }
 function confirm(title,text,accept,labelText='Подтвердить') {
   show(title,box('div','stack',dim(text),actions(b('Отмена',()=>dialog.close()),b(labelText,accept,'danger'))));
@@ -240,8 +242,9 @@ function materialList(output) {
       minus.setAttribute('aria-label','Уменьшить количество: '+row.name);
       plus.setAttribute('aria-label','Увеличить количество: '+row.name);
       const stepLabel='Шаг '+quantityFormat.format(effectiveStep)+' '+unit;
-      const stepControl=current?b(stepLabel,()=>itemStepForm(current),'step-link'):dim(stepLabel);
-      if (current) stepControl.setAttribute('aria-label','Изменить шаг: '+row.name);
+      const canChangeStep=current && !current.superseded;
+      const stepControl=canChangeStep?b(stepLabel,()=>itemStepForm(current),'step-link'):dim(stepLabel);
+      if (canChangeStep) stepControl.setAttribute('aria-label','Изменить шаг: '+row.name);
       const prices=unitPrice(row.retail)+' клиенту за 1 '+unit
         +(state.preferences.showMaterialCost?' · '+unitPrice(row.cost)+' закупка':'');
       const card=box('div','item',box('div','item-description',el('strong',(current?.favorite?'★ ':'')+row.name),
@@ -544,44 +547,88 @@ function purchasesPage() {
 function materialForm(existing) {
   const maxOrder=state.materials.reduce((max,item)=>Math.max(max,item.order||0),0);
   const row=existing||{id:uid(),name:'',unit:'г',cost:'',retail:'',active:true,order:Math.min(100000,maxOrder+1)};
-  const cost=input('cost',row.cost,{inputMode:'decimal'});
-  const retail=input('retail',row.retail,{inputMode:'decimal'});
-  const capacity=input('pack-size','',{inputMode:'decimal'});
-  const packaging=input('pack-price','',{inputMode:'decimal'});
-  const percent=input('markup','',{inputMode:'decimal',placeholder:'0'});
-  const unit=choose('unit',row.unit,[['г','Граммы'],['доза','Дозы'],['шт','Штуки']]);
-  unit.disabled=Boolean(existing);
-  const calc=details('Рассчитать цену из упаковки',box('div','stack',
-    label('Цена упаковки, ₽',packaging),label('Сколько граммов, доз или штук',capacity),
-    b('Подставить цену закупки',()=>{cost.value=priceFromPackage(packaging.value,capacity.value);}),
-    label('Наценка, %',percent),b('Подставить цену клиенту',()=>{retail.value=priceWithMarkup(cost.value,percent.value);})));
+  const unit=choose('unit',row.unit,[['г','Граммы (г)'],['доза','Дозы'],['шт','Штуки (шт.)']]);
+  const decimal=(name,value,options={})=>input(name,value,{inputMode:'decimal',maxLength:16,...options});
+  const cost=decimal('cost',row.cost,{required:true,placeholder:'0,00'});
+  const retail=decimal('retail',row.retail,{required:true,placeholder:'0,00'});
+  const step=decimal('step',row.step,{placeholder:'Шаг группы'});
+  const packaging=decimal('packaging',row.calculator?.packaging);
+  const capacity=decimal('capacity',row.calculator?.capacity);
+  const markup=decimal('markup',row.calculator?.markup,{placeholder:'0'});
+  const costLabel=label('',cost),retailLabel=label('',retail),capacityLabel=label('',capacity),stepLabel=label('',step);
+  const note=dim('');
+  const preview=el('p','','material-preview');
+  preview.setAttribute('aria-live','polite');
   const favorite=input('favorite','on',{type:'checkbox',checked:row.favorite===true});
+  const byUnit=[cost,retail,step,capacity];
+  let previousUnit=unit.value;
+  const unitFields=new Map();
+  const changed=()=>Boolean(existing && unit.value!==row.unit);
+  const update=()=>{
+    costLabel.firstChild.textContent='Закупка за 1 '+unit.value+', ₽';
+    retailLabel.firstChild.textContent='Клиенту за 1 '+unit.value+', ₽';
+    capacityLabel.firstChild.textContent='В упаковке, '+unit.value;
+    stepLabel.firstChild.textContent='Свой шаг +/−, '+unit.value;
+    const group=quantityFormat.format(state.preferences[stepKeys[unit.value]]);
+    step.placeholder='Шаг группы: '+group;
+    note.hidden=!changed();
+    note.textContent=changed()?'Укажите цены для новой единицы. Старые визиты сохранят свою единицу и сумму.':'';
+    try {
+      preview.textContent=cost.value.trim() && retail.value.trim() ?
+        'За 1 '+unit.value+': '+unitPrice(price(cost.value,'Закупочная цена'))+' закупка · '+unitPrice(price(retail.value,'Цена клиенту'))+' клиенту'
+        : 'Введите обе цены за 1 '+unit.value+'. Если цена нулевая, введите 0.';
+    } catch {preview.textContent='Проверьте цены. Можно использовать запятую или точку.';}
+  };
+  unit.onchange=()=>{
+    unitFields.set(previousUnit,byUnit.map(field=>field.value));
+    if (existing || previousUnit!==row.unit || unitFields.has(unit.value)) {
+      const values=unitFields.get(unit.value)||[];
+      byUnit.forEach((field,index)=>{field.value=values[index]??'';});
+    } else {
+      capacity.value='';
+      step.value='';
+    }
+    previousUnit=unit.value;
+    update();
+  };
+  cost.oninput=retail.oninput=update;
+  update();
+  const calculator=details('Калькулятор упаковки',box('div','stack',
+    label('Цена упаковки, ₽',packaging),capacityLabel,
+    b('Подставить цену закупки',()=>{cost.value=priceFromPackage(packaging.value,capacity.value);update();}),
+    label('Наценка, %',markup),b('Подставить цену клиенту',()=>{retail.value=priceWithMarkup(cost.value,markup.value);update();})));
   const save=form(async fields=>{
     requireThat(fields.name.trim(),'Укажите название расходника.');
-    const step=fields.step.trim()?stepValue(fields.step):0;
-    const order=Number(fields.order);
-    requireThat(Number.isInteger(order) && order>=0 && order<=100000,'Укажите целое число от 0 до 100 000.');
-    const record={...row,name:fields.name.trim(),unit:unit.value,cost:price(fields.cost,'Цена закупки'),
-      retail:price(fields.retail,'Цена клиенту'),description:fields.description.trim(),favorite:fields.favorite==='on',order};
-    if (step>0) record.step=step;
+    requireThat(Object.hasOwn(units,fields.unit),'Выберите единицу измерения.');
+    requireThat(fields.cost.trim() && fields.retail.trim(),'Укажите обе цены. Для бесплатной позиции введите 0.');
+    if (changed() && Object.hasOwn(draft.qty,row.id) && !draft.original.some(item=>item.id===row.id)) {
+      requireThat(!String(draft.qty[row.id]).trim() || fixed(draft.qty[row.id],'Количество',100000,3)===0,
+        'Этот расходник уже введён в черновике. Сохраните визит или уберите количество, затем смените единицу.');
+    }
+    const editedStep=fields.step.trim()?stepValue(fields.step):0;
+    const record={...row,name:fields.name.trim(),unit:fields.unit,cost:price(fields.cost,'Цена закупки'),
+      retail:price(fields.retail,'Цена клиенту'),description:fields.description.trim(),favorite:fields.favorite==='on',
+      order:materialOrderValue(fields.order),calculator:materialCalculator(fields)};
+    if (editedStep>0) record.step=editedStep;
     else delete record.step;
-    await write(data=>({...data,materials:existing?data.materials.map(m=>m.id===row.id?record:m):data.materials.concat(record),revised:true}));
-    dialog.close();
-    render();
-    notify('Расходник сохранён');
-  },'Сохранить цены',label('Название',input('name',row.name,{required:true,maxLength:120})),label('Единица измерения',unit),
-  label('Закупка за единицу, ₽',cost),label('Клиенту за единицу, ₽',retail),
-  label('Краткое описание',input('description',row.description,{maxLength:160,placeholder:'Например, оттенок 7.1'})),
-  label('Свой шаг +/−',input('step',row.step,{inputMode:'decimal',placeholder:'По группе'})),
-  label('Позиция в списке',input('order',row.order??0,{inputMode:'numeric',maxLength:6,required:true})),dim('Меньшее число показывает расходник выше при своей сортировке.'),
-  label('В избранное',favorite),calc);
+    const replacementId=changed()?uid():row.id;
+    await write(data=>({...data,materials:changeMaterial(data.materials,record,replacementId),revised:true}));
+    redrawInPlace();
+    notify(changed()?'Единица изменена. Старые визиты сохранены.':'Расходник сохранён');
+  },'Сохранить изменения',
+  box('section','editor-section',label('Название',input('name',row.name,{required:true,maxLength:120})),
+    label('Единица измерения',unit),note,label('Краткое описание',input('description',row.description,{maxLength:160,placeholder:'Например, оттенок 7.1'}))),
+  box('section','editor-section',el('h3','Цены'),box('div','duo',costLabel,retailLabel),preview,calculator),
+  box('section','editor-section',el('h3','Шаг и порядок'),box('div','duo',stepLabel,
+    label('Позиция в списке',input('order',row.order??0,{inputMode:'numeric',maxLength:6,required:true}))),
+  dim('Пустое поле шага использует шаг группы. Меньшая позиция поднимает расходник выше при ручной сортировке.'),
+  label('В избранное',favorite)));
   const toggle=async ()=>{
-    await write(data=>({...data,materials:data.materials.map(m=>m.id===row.id?{...m,active:!m.active}:m)}));
-    dialog.close();
-    render();
+    await write(data=>({...data,materials:data.materials.map(item=>item.id===row.id&&!item.superseded?{...item,active:!row.active}:item)}));
+    redrawInPlace();
     notify(row.active?'Расходник в архиве':'Расходник возвращён');
   };
-  show(existing?'Цены расходника':'Новый расходник',box('div','stack',save,...(existing?[b(
+  show(existing?'Редактировать расходник':'Новый расходник',box('div','material-editor stack',save,...(existing?[b(
     row.active?'Архивировать':'Вернуть из архива',
     ()=>row.active?confirm('Архивировать расходник?','Цены в прежних визитах сохранятся.',toggle,'Архивировать'):toggle(),row.active?'danger':'')]:[])));
 }
@@ -596,7 +643,7 @@ function materialsPage() {
   const query=input('search','',{type:'search',placeholder:'Название или описание'});
   const favorites=input('favorites','on',{type:'checkbox'});
   const group=choose('catalog-group','all',[['all','Все группы'],...Object.entries(units)]);
-  const availability=choose('catalog-active','all',[['all','Все'],['active','Рабочие'],['archive','Архив']]);
+  const availability=choose('catalog-active','active',[['all','Все'],['active','Рабочие'],['archive','Архив']]);
   const refresh=()=>{
     const text=query.value.trim().toLocaleLowerCase('ru');
     const rows=state.materials.filter(row=>(!favorites.checked || row.favorite) &&
@@ -605,19 +652,21 @@ function materialsPage() {
       (row.name+' '+(row.description||'')).toLocaleLowerCase('ru').includes(text)).sort(materialOrder);
     list.replaceChildren();
     if (!rows.length) list.append(dim('Подходящих расходников нет.'));
-    appendPages(list,rows,row=>box('article','record',box('div','row',box('div','',
-      el('strong',(row.favorite?'★ ':'')+row.name+(row.active?'':' · архив')),
-      dim([row.description,unitPrice(row.cost)+' закупка · '+unitPrice(row.retail)+' клиенту за 1 '+row.unit,
-        'Шаг +/− '+materialStep(row)+' '+row.unit].filter(Boolean).join(' · '))),
-      b('Изменить',()=>materialForm(row)))));
+    const priceTile=(title,value)=>box('div','material-price',dim(title),el('strong',unitPrice(value)));
+    appendPages(list,rows,row=>box('article','record material-card',
+      box('div','row',el('strong',(row.favorite?'★ ':'')+row.name),el('span',row.unit,'unit-tag')),
+      ...(row.description?[dim(row.description)]:[]),
+      box('div','material-prices',priceTile('Закупка за 1 '+row.unit,row.cost),priceTile('Клиенту за 1 '+row.unit,row.retail)),
+      box('div','row',dim(row.superseded?'Предыдущая единица':row.active?'Шаг ± '+quantityFormat.format(materialStep(row))+' '+row.unit:'В архиве'),
+        ...(row.superseded?[]:[b('Изменить',()=>materialForm(row),'material-edit')]))));
   };
   query.oninput=refresh;
   favorites.onchange=refresh;
   group.onchange=availability.onchange=refresh;
   refresh();
-  return box('section','',head,dim('Начальные цены примерные. Укажите свои перед первой записью.'),
-    label('Поиск расходников',query),box('div','duo',label('Группа',group),label('Статус',availability)),
-    label('Только избранное',favorites),b('Шаги +/−',groupStepForm),list);
+  return box('section','material-catalog',head,
+    panel(label('Поиск расходников',query),box('div','duo',label('Группа',group),label('Статус',availability)),
+      box('div','material-filter-row',label('Только избранное',favorites),b('Шаги +/−',groupStepForm))),list);
 }
 function restoreDocument(json) {
   let parsed;

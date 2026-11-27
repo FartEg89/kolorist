@@ -73,6 +73,7 @@ function fixed(value,label,max,digits=2) {
 const price = (value,label) => fixed(value,label,1000000,6)/1000000;
 const roundRatio=(numerator,denominator)=>Number((numerator+denominator/2n)/denominator);
 function priceFromPackage(packaging,capacity) {
+  requireThat(String(packaging??'').trim(),'Укажите цену упаковки. Если она бесплатная, введите 0.');
   const pack=fixed(packaging,'Цена упаковки',10000000);
   const count=fixed(capacity,'Количество в упаковке',10000000,3);
   requireThat(count>0,'Количество в упаковке должно быть больше нуля.');
@@ -81,11 +82,40 @@ function priceFromPackage(packaging,capacity) {
   return micros/1000000;
 }
 function priceWithMarkup(cost,markup) {
+  requireThat(String(cost??'').trim(),'Сначала укажите закупочную цену.');
   const base=fixed(cost,'Цена закупки',1000000,6);
   const percent=fixed(markup,'Наценка',10000);
   const micros=roundRatio(BigInt(base)*BigInt(10000+percent),10000n);
   requireThat(micros<=1000000000000,'Цена единицы превышает 1 млн ₽.');
   return micros/1000000;
+}
+function materialOrderValue(value) {
+  const text=String(value??'').trim();
+  requireThat(/^\d{1,6}$/.test(text) && Number(text)<=100000,'Позиция в списке — целое число от 0 до 100 000.');
+  return Number(text);
+}
+function materialCalculator(raw={}) {
+  const result={};
+  for (const [key,title,max,digits] of [
+    ['packaging','Цена упаковки',10000000,2],['capacity','Количество в упаковке',10000000,3],['markup','Наценка',10000,2]
+  ]) {
+    if (!String(raw[key]??'').trim()) continue;
+    const number=fixed(raw[key],title,max,digits)/10**digits;
+    requireThat(key!=='capacity' || number>0,'Количество в упаковке должно быть больше нуля.');
+    result[key]=number;
+  }
+  return result;
+}
+function changeMaterial(materials,record,replacementId) {
+  const previous=materials.find(item=>item.id===record.id);
+  if (!previous) return materials.concat(record);
+  requireThat(!previous.superseded,'У этого расходника уже есть новая единица. Откройте его рабочую карточку.');
+  // Новый ID исключает пересчёт граммов как доз даже при явном обновлении цен старого визита.
+  if (previous.unit!==record.unit) {
+    return materials.map(item=>item.id===record.id?{...item,active:false,favorite:false,superseded:true}:item)
+      .concat({...record,id:replacementId,active:previous.active});
+  }
+  return materials.map(item=>item.id===record.id?{...record,active:previous.active}:item);
 }
 function date(value) {
   requireThat(typeof value==='string' && /^\d{4}-\d\d-\d\d$/.test(value) && value>='1900-01-01' && value<='2199-12-31','Выберите дату.');
@@ -184,7 +214,9 @@ function restore(backup) {
   const data=backup.format==='parik-backup'?fromGoogle(backup.data):backup.data;
   requireThat(data.version===1,'Эта версия копии не поддерживается.');
   const materials=unique(array(data.materials).map(row=>({...material(row),active:validateFlag(row.active),favorite:row.favorite===true,
-    order:Number.isSafeInteger(row.order)?row.order:0,...(row.step===undefined?{}:{step:fixed(row.step,'Шаг',10000,3)/1000})})));
+    order:Number.isSafeInteger(row.order)?row.order:0,...(row.step===undefined?{}:{step:fixed(row.step,'Шаг',10000,3)/1000}),
+    ...(row.superseded===true?{superseded:true,active:false}:{}),
+    ...(row.calculator?{calculator:materialCalculator(row.calculator)}:{})})));
   const clients=unique(array(data.clients).map(row=>({id:validateId(row.id),name:text(row.name,120,true),
     phone:text(row.phone,60),note:text(row.note,2000),benefit:validateFlag(row.benefit),...discount(row)})));
   const purchases=unique(array(data.purchases).map(row=>({id:validateId(row.id),date:date(row.date),
