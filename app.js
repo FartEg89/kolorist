@@ -1,13 +1,11 @@
-import {units,uid,money,unitPrice,today,showDate,blankVisit,calculate,report,newest,discount,price,priceFromPackage,priceWithMarkup,fixed,date,backup,restore,requireThat} from './model.js';
-import {read,change,isActivated,rememberActivation} from './storage.js';
-import {matchesCode} from './activation.js';
 
 const $=id=>document.getElementById(id);
 const root=$('content');
 const dialog=$('dialog');
 const body=$('dialog-body');
 let state,draft,tab='visit',toastTimer;
-let pendingDraft=Promise.resolve();
+let pendingDraft=Promise.resolve(), nextDraft, draftTimer;
+let installPrompt;
 let savingVisit=false;
 let reportMode='day',reportDate=today();
 let visitLists=new Set();
@@ -29,6 +27,7 @@ const actions=(...items)=>box('div','actions',...items);
 const dim=text=>el('p',text,'muted');
 function notify(text) {
   const toast=$('toast');
+  (dialog.open?dialog:document.body).append(toast);
   toast.textContent=text;
   toast.hidden=false;
   clearTimeout(toastTimer);
@@ -91,13 +90,28 @@ function jump(next) {
   if (savingVisit) return;
   tab=next;
   render();
-  window.scrollTo(0,0);
+  root.scrollTop=0;
 }
-async function write(update) { state=await change(update); }
+async function write(update,clearDraft=false) {state=await change(update,clearDraft);}
 function remember() {
-  const snapshot=clone(draft);
-  pendingDraft=pendingDraft.catch(()=>{}).then(()=>write(data=>({...data,draft:snapshot})));
-  pendingDraft.catch(()=>notify('Черновик не записался. Проверьте свободное место.'));
+  nextDraft=clone(draft);
+  clearTimeout(draftTimer);
+  draftTimer=setTimeout(flushDraft,220);
+}
+function flushDraft() {
+  clearTimeout(draftTimer);
+  if (!nextDraft) return pendingDraft;
+  const snapshot=nextDraft;
+  nextDraft=null;
+  pendingDraft=saveDraft(snapshot);
+  pendingDraft.catch(()=>notify('Черновик не записался. Проверьте свободное место или откройте кабинет заново.'));
+  return pendingDraft;
+}
+document.addEventListener('visibilitychange',()=>{if (document.visibilityState==='hidden' && nextDraft) flushDraft();});
+window.addEventListener('pagehide',()=>{if(nextDraft) flushDraft();});
+function freshDraft() {
+  const p=state.preferences;
+  return {...blankVisit(),amount:p.defaultAmount||'',type:p.defaultType,target:p.defaultTarget};
 }
 function setDraft(next) {
   draft=next;
@@ -111,7 +125,8 @@ const discountFields = row => box('div','duo',
   label('Применить к',choose('target',row.target,[['работа','Работе'],['весь_чек','Всему чеку']])));
 function personLabel() { return draft.name||'Без клиента'; }
 function setPerson(person) {
-  const benefit=person?.benefit?discount(person):discount({});
+  const defaults=freshDraft();
+  const benefit=person?.benefit?discount(person):discount(defaults);
   Object.assign(draft,{...benefit,client:person?.id||'',name:person?.name||''});
   remember();
   dialog.close();
@@ -139,9 +154,15 @@ function materialList(output) {
     active.set(snap.id,draft.refresh?(state.materials.find(row=>row.id===snap.id)||snap):snap);
   }
   for (const [unit,name] of Object.entries(units)) {
-    const rows=[...active.values()].filter(row=>row.unit===unit);
+    const rows=[...active.values()].filter(row=>row.unit===unit).sort(materialOrder);
     if (!rows.length) continue;
-    const count=()=>rows.filter(row=>Number(String(draft.qty[row.id]??'').replace(',','.'))>0).length;
+    const overview=()=>{
+      const selected=rows.map(row=>[row.name,Number(String(draft.qty[row.id]??'').replace(',','.'))]).filter(row=>row[1]>0&&Number.isFinite(row[1]));
+      if (!selected.length) return [name,rows.slice(0,3).map(row=>row.name).join(', ')];
+      const total=selected.reduce((sum,row)=>sum+row[1],0);
+      return [name+' · '+quantityFormat.format(total)+' '+unit,selected.slice(0,3).map(row=>row[0]+' '+quantityFormat.format(row[1])+' '+unit).join(', ')];
+    };
+    const summary=()=>overview().join(' · ');
     const items=box('div','stack');
     let group;
     for (const row of rows) {
@@ -150,21 +171,22 @@ function materialList(output) {
       const update=()=>{
         if (field.value.trim()) draft.qty[row.id]=field.value;
         else delete draft.qty[row.id];
-        group.firstChild.textContent=name+(count()?' · '+count():'');
+        group.firstChild.textContent=summary();
         remember();
         output();
       };
       field.oninput=update;
       const step=sign=>{
-        field.value=Math.min(100000,Math.max(0,fixed(field.value,'Количество',100000,3)/1000+sign*(unit==='г'?5:1)));
+        const next=fixed(field.value,'Количество',100000,3)+sign*fixed(materialStep(row),'Шаг',10000,3);
+        field.value=Math.min(100000000,Math.max(0,next))/1000;
         update();
       };
       const minus=b('−',()=>step(-1)),plus=b('+',()=>step(1));
       minus.setAttribute('aria-label','Уменьшить количество: '+row.name);
       plus.setAttribute('aria-label','Увеличить количество: '+row.name);
-      items.append(box('div','item',box('div','',el('strong',row.name),dim(unitPrice(row.retail)+' за 1 '+unit)),box('div','qty',minus,field,plus)));
+      items.append(box('div','item',box('div','',el('strong',row.name),dim([row.description,unitPrice(row.retail)+' за 1 '+unit].filter(Boolean).join(' · '))),box('div','qty',minus,field,plus)));
     }
-    group=details(name+(count()?' · '+count():''),items,visitLists.has(unit)||count()>0);
+    group=details(summary(),items,visitLists.has(unit)||overview()[0]!==name||state.preferences.expandMaterials);
     group.ontoggle=()=>group.open?visitLists.add(unit):visitLists.delete(unit);
     result.append(group);
   }
@@ -185,11 +207,14 @@ function editVisit(row) {
   else open();
 }
 function hasDraft() {
-  return Boolean(draft.editing||draft.client||draft.work||draft.recipe||draft.note||draft.amount||Object.keys(draft.qty).length);
+  const p=state.preferences;
+  const discountChanged=String(draft.amount||'')!==String(p.defaultAmount||'')
+    || draft.type!==p.defaultType || draft.target!==p.defaultTarget;
+  return Boolean(draft.editing||draft.client||draft.work||draft.recipe||draft.note||discountChanged||Object.keys(draft.qty).length);
 }
 function historyToDraft(row,person,withMaterials) {
   const open=()=>{
-    const next={...blankVisit(),client:person.id,name:person.name,recipe:row.recipe,...(person.benefit?discount(person):{})};
+    const next={...freshDraft(),client:person.id,name:person.name,recipe:row.recipe,...(person.benefit?discount(person):{})};
     if (withMaterials) {
       next.work=row.work/100;
       next.qty=Object.fromEntries(row.items.filter(x=>state.materials.some(m=>m.id===x.id&&m.active)).map(x=>[x.id,x.qty]));
@@ -206,7 +231,7 @@ function visitPage() {
   const title=el('h1',draft.editing?'Редактирование визита':'Новый визит');
   const header=box('div','head',title);
   if (draft.editing) header.append(b('Отменить правку',()=>confirm('Закрыть правку?','Изменения черновика будут удалены.',()=>{
-    dialog.close();setDraft(blankVisit());
+    dialog.close();setDraft(freshDraft());
   },'Закрыть')));
   const selected=state.clients.find(x=>x.id===draft.client);
   const previous=selected&&state.visits.filter(x=>x.client===selected.id).sort(newest)[0];
@@ -239,7 +264,7 @@ function visitPage() {
     }
   };
   const amounts=box('aside','bill',box('div','summary',el('strong','Итог чека'),amount),box('div','row',fund,net),saving,error);
-  const recipes=details('Формула окрашивания и заметка',box('div','stack',label('Формула',recipe),label('Заметка',note)),Boolean(draft.recipe||draft.note));
+  const recipes=details('Формула окрашивания и заметка',box('div','stack',label('Формула',recipe),label('Заметка',note)),Boolean(draft.recipe||draft.note||state.preferences.expandRecipe));
   const discounts=details('Скидка',discountFields(draft),Boolean(draft.amount));
   const materials=box('div','stack',el('h2','Расходники'),materialList(update));
   if (draft.editing && draft.original.length) materials.append(b(draft.refresh?'Вернуть цены визита':'Обновить цены в этом визите',()=>{
@@ -253,7 +278,7 @@ function visitPage() {
     visitForm.inert=true;
     let saved;
     try {
-      await pendingDraft.catch(()=>{});
+      await flushDraft().catch(()=>{});
       await write(data=>{
         const current=data.visits.find(v=>v.id===savingDraft.id);
         if (savingDraft.editing) {
@@ -261,26 +286,35 @@ function visitPage() {
             (current.revision??1)===(savingDraft.baseRevision??1),'Визит изменился. Откройте его заново из итогов.');
         } else requireThat(!current,'Этот визит уже сохранён.');
         const math=calculate(savingDraft,data.materials);
+        requireThat(savingDraft.editing || String(savingDraft.work).trim() || math.items.length
+          || savingDraft.recipe.trim() || savingDraft.note.trim(), 'Введите стоимость работы, расходники или формулу.');
         saved={...math,id:savingDraft.id,date:date(savingDraft.date),client:savingDraft.client,name:savingDraft.name,
           recipe:savingDraft.recipe.trim(),note:savingDraft.note.trim(),created:current?.created||new Date().toISOString(),
           revision:current?(current.revision??1)+1:1};
         return {...data,draft:null,visits:data.visits.filter(v=>v.id!==saved.id).concat(saved)};
-      });
+      },true);
     } finally {
       savingVisit=false;
       visitForm.inert=false;
     }
-    draft=blankVisit();
+    draft=freshDraft();
     visitLists=new Set();
+    if (savingDraft.editing) reportDate=saved.date;
     jump(savingDraft.editing?'report':'visit');
     notify('Визит сохранён · '+money(saved.total));
   },draft.editing?'Сохранить изменения':'Сохранить визит',person,panel(label('Стоимость работы, ₽',work),label('Дата',day)),materials,recipes,discounts,amounts);
-  amounts.append(visitForm.lastChild);
+  visitForm.id='visit-form';
+  const submit=visitForm.lastChild;
+  submit.setAttribute('form',visitForm.id);
+  amounts.append(submit);
+  const dock=$('visit-dock');
+  dock.replaceChildren(amounts);
+  dock.hidden=false;
   visitForm.oninput=event=>{
     if (['work','date','recipe','note','amount','target','type'].includes(event.target.name)) {
       draft[event.target.name]=event.target.value;
       remember();
-      update();
+      if (['work','amount','target','type'].includes(event.target.name)) update();
     }
   };
   update();
@@ -356,9 +390,9 @@ function clientsPage() {
 function visitCard(row) {
   const controls=actions(b('Изменить',()=>editVisit(row)),b('Удалить',()=>confirm('Удалить визит?',
     'Визит за '+showDate(row.date)+' исчезнет из истории и итогов.',async ()=>{
-      await pendingDraft.catch(()=>{});
-      await write(data=>({...data,visits:data.visits.filter(x=>x.id!==row.id),draft:data.draft?.id===row.id?null:data.draft}));
-      if (draft.id===row.id) draft=blankVisit();
+      await flushDraft().catch(()=>{});
+      await write(data=>({...data,visits:data.visits.filter(x=>x.id!==row.id)}),draft.id===row.id);
+      if (draft.id===row.id) draft=freshDraft();
       dialog.close();
       render();
       notify('Визит удалён');
@@ -390,18 +424,18 @@ function reportPage() {
   return box('section','',el('h1','Итоги'),box('div','panel duo',label('Период',mode),label(reportMode==='day'?'Дата':'Месяц',picker)),
     metrics,dim('Визитов: '+result.visits.length+' · средний чек '+money(result.average)),el('h2','Визиты периода'),history);
 }
-function purchaseForm() {
-  show('Новая закупка',form(async fields=>{
-    const row={id:uid(),date:date(fields.date),supplier:fields.supplier.trim(),note:fields.note.trim(),
+function purchaseForm(existing) {
+  show(existing?'Редактировать закупку':'Новая закупка',form(async fields=>{
+    const row={id:existing?.id||uid(),date:date(fields.date),supplier:fields.supplier.trim(),note:fields.note.trim(),
       total:fixed(fields.total,'Сумма',10000000)};
     requireThat(row.total>0,'Укажите сумму больше нуля.');
-    await write(data=>({...data,purchases:data.purchases.concat(row)}));
+    await write(data=>({...data,purchases:data.purchases.filter(item=>item.id!==row.id).concat(row)}));
     dialog.close();
     render();
     notify('Закупка сохранена');
   },'Сохранить закупку',
-    label('Сумма, ₽',input('total','',{inputMode:'decimal',required:true})),label('Дата',input('date',today(),{type:'date',required:true})),
-    label('Поставщик',input('supplier','',{maxLength:120})),label('Описание',input('note','',{rows:2,maxLength:1000}))));
+    label('Сумма, ₽',input('total',existing?existing.total/100:'',{inputMode:'decimal',required:true})),label('Дата',input('date',existing?.date||today(),{type:'date',required:true})),
+    label('Поставщик',input('supplier',existing?.supplier||'',{maxLength:120})),label('Описание',input('note',existing?.note||'',{rows:2,maxLength:1000}))));
 }
 function purchasesPage() {
   const list=box('div','stack');
@@ -409,13 +443,13 @@ function purchasesPage() {
   if (!purchases.length) list.append(panel(dim('Закупок пока нет.')));
   appendPages(list,purchases,row=>box('article','record',box('div','row',el('strong',row.supplier||'Закупка'),el('strong',money(row.total))),
     dim(showDate(row.date)),...(row.note?[el('p',row.note,'prewrap')]:[]),
-    b('Удалить закупку',()=>confirm('Удалить закупку?',money(row.total)+' за '+showDate(row.date),async ()=>{
+    actions(b('Изменить закупку',()=>purchaseForm(row)),b('Удалить закупку',()=>confirm('Удалить закупку?',money(row.total)+' за '+showDate(row.date),async ()=>{
       await write(data=>({...data,purchases:data.purchases.filter(x=>x.id!==row.id)}));
       dialog.close();
       render();
       notify('Закупка удалена');
-    },'Удалить'),'danger')));
-  return box('section','',box('div','head',el('h1','Закупки'),b('Добавить',purchaseForm,'primary')),list);
+    },'Удалить'),'danger'))));
+  return box('section','',box('div','head',el('h1','Закупки'),b('Добавить',()=>purchaseForm(),'primary')),list);
 }
 function materialForm(existing) {
   const row=existing||{id:uid(),name:'',unit:'г',cost:'',retail:'',active:true};
@@ -430,16 +464,23 @@ function materialForm(existing) {
     label('Цена упаковки, ₽',packaging),label('Сколько граммов, доз или штук',capacity),
     b('Подставить цену закупки',()=>{cost.value=priceFromPackage(packaging.value,capacity.value);}),
     label('Наценка, %',percent),b('Подставить цену клиенту',()=>{retail.value=priceWithMarkup(cost.value,percent.value);})));
+  const favorite=input('favorite','on',{type:'checkbox',checked:row.favorite===true});
   const save=form(async fields=>{
     requireThat(fields.name.trim(),'Укажите название расходника.');
+    const step=fixed(fields.step,'Шаг',10000,3)/1000;
+    requireThat(!fields.step.trim() || step>0,'Укажите шаг больше нуля или оставьте поле пустым.');
     const record={...row,name:fields.name.trim(),unit:unit.value,cost:price(fields.cost,'Цена закупки'),
-      retail:price(fields.retail,'Цена клиенту')};
+      retail:price(fields.retail,'Цена клиенту'),description:fields.description.trim(),favorite:fields.favorite==='on'};
+    if (step>0) record.step=step;
+    else delete record.step;
     await write(data=>({...data,materials:existing?data.materials.map(m=>m.id===row.id?record:m):data.materials.concat(record),revised:true}));
     dialog.close();
     render();
     notify('Расходник сохранён');
   },'Сохранить цены',label('Название',input('name',row.name,{required:true,maxLength:120})),label('Единица измерения',unit),
-  label('Закупка за единицу, ₽',cost),label('Клиенту за единицу, ₽',retail),calc);
+  label('Закупка за единицу, ₽',cost),label('Клиенту за единицу, ₽',retail),
+  label('Краткое описание',input('description',row.description,{maxLength:160,placeholder:'Например, оттенок 7.1'})),
+  label('Свой шаг +/−',input('step',row.step,{inputMode:'decimal',placeholder:'По группе'})),label('В избранное',favorite),calc);
   const toggle=async ()=>{
     await write(data=>({...data,materials:data.materials.map(m=>m.id===row.id?{...m,active:!m.active}:m)}));
     dialog.close();
@@ -450,72 +491,165 @@ function materialForm(existing) {
     row.active?'Архивировать':'Вернуть из архива',
     ()=>row.active?confirm('Архивировать расходник?','Цены в прежних визитах сохранятся.',toggle,'Архивировать'):toggle(),row.active?'danger':'')]:[])));
 }
+function materialOrder(a,b) {
+  return Number(b.active===true)-Number(a.active===true) || Number(b.favorite===true)-Number(a.favorite===true)
+    || (a.order||0)-(b.order||0);
+}
+function materialStep(row) {return row.step || state.preferences[stepKeys[row.unit]];}
 function materialsPage() {
   const head=box('div','head',el('h1','Расходники'),b('Добавить',()=>materialForm(),'primary'));
   const list=box('div','stack');
-  const sorted=state.materials.slice().sort((a,b)=>Number(b.active)-Number(a.active));
-  appendPages(list,sorted,row=>box('article','record',box('div','row',box('div','',
-    el('strong',row.name+(row.active?'':' · архив')),dim(unitPrice(row.cost)+' закупка · '+unitPrice(row.retail)+' клиенту за 1 '+row.unit)),
-  b('Изменить',()=>materialForm(row)))));
-  return box('section','',head,dim('Начальные цены примерные. Проверьте каждый расходник перед первой записью.'),list);
+  const query=input('search','',{type:'search',placeholder:'Название или описание'});
+  const favorites=input('favorites','on',{type:'checkbox'});
+  const refresh=()=>{
+    const text=query.value.trim().toLocaleLowerCase('ru');
+    const rows=state.materials.filter(row=>(!favorites.checked || row.favorite) &&
+      (row.name+' '+(row.description||'')).toLocaleLowerCase('ru').includes(text)).sort(materialOrder);
+    list.replaceChildren();
+    if (!rows.length) list.append(dim('Подходящих расходников нет.'));
+    appendPages(list,rows,row=>box('article','record',box('div','row',box('div','',
+      el('strong',(row.favorite?'★ ':'')+row.name+(row.active?'':' · архив')),
+      dim([row.description,unitPrice(row.cost)+' закупка · '+unitPrice(row.retail)+' клиенту за 1 '+row.unit,
+        'Шаг +/− '+materialStep(row)+' '+row.unit].filter(Boolean).join(' · '))),
+      b('Изменить',()=>materialForm(row)))));
+  };
+  query.oninput=refresh;
+  favorites.onchange=refresh;
+  refresh();
+  return box('section','',head,dim('Начальные цены примерные. Укажите свои перед первой записью.'),
+    label('Поиск расходников',query),label('Только избранное',favorites),list);
 }
-function saveFile() {
-  const file=new File([backup(state)],'kolorist-'+today()+'.json',{type:'application/json'});
-  if (navigator.canShare?.({files:[file]})) {
-    return navigator.share({files:[file]}).then(()=>notify('Копия передана в меню сохранения.')).catch(error=>{
-      if (error.name!=='AbortError') downloadBackup(file);
-    });
+function restoreDocument(json) {
+  let parsed;
+  try { parsed=JSON.parse(json); } catch { throw new Error('Файл не содержит резервную копию.'); }
+  const imported=restore(parsed);
+  confirm('Восстановить записи?',
+    'Файл заменит местные записи. В копии визитов: '+imported.visits.length+', клиентов: '+imported.clients.length+'.',async ()=>{
+      await flushDraft().catch(()=>{});
+      await write(()=>imported,true);
+      applyPreferences();
+      draft=freshDraft();
+      reportDate=today();
+      dialog.close();
+      render();
+      notify('Записи восстановлены.');
+    },'Восстановить');
+}
+function exportBackup() {
+  const field=()=>input('password','',{type:'password',minLength:8,maxLength:128,required:true,autocomplete:'off',spellcheck:false});
+  const first=field(),second=field();
+  const message=el('p','','danger');
+  message.setAttribute('role','status');
+  const entry=form(async ()=>{
+    message.textContent='';
+    try {
+      requireThat(first.value.trim() && first.value.length>=8,'Введите пароль от 8 символов.');
+      requireThat(first.value===second.value,'Пароли не совпадают.');
+      await flushDraft().catch(()=>{});
+      const saving=native('exportBackup',{password:first.value,json:backup(state),date:today()});
+      first.value=second.value='';
+      const archive=await saving;
+      if (!archive) return;
+      if (inAPK) {dialog.close();notify('Защищённая копия сохранена.');return;}
+      show('Копия готова',dim('Сохраните зашифрованный файл вне этого устройства.'),
+        b('Сохранить файл',()=>downloadArchive(archive),'primary'));
+    } catch(error) {message.textContent=error.message;}
+  },'Продолжить',label('Пароль копии',first),label('Повторите пароль',second),message);
+  show('Защитить резервную копию',dim('Придумайте пароль от 8 символов. Сохраните его отдельно от файла.'),entry);
+}
+async function downloadArchive(archive) {
+  if (navigator.canShare?.({files:[archive]})) {
+    try {await navigator.share({files:[archive]});dialog.close();return;}
+    catch(error) {if (error.name==='AbortError') return;}
   }
-  downloadBackup(file);
-}
-function downloadBackup(file) {
-  const url=URL.createObjectURL(file);
+  const url=URL.createObjectURL(archive);
   const link=el('a');
+  link.download=archive.name;
   link.href=url;
-  link.download=file.name;
   document.body.append(link);
   link.click();
   link.remove();
   setTimeout(()=>URL.revokeObjectURL(url),30000);
-  notify('Резервная копия подготовлена.');
+  dialog.close();
+  notify('Проверьте файл в папке загрузок.');
+}
+async function importBackup() {
+  const selection=await native('openBackup');
+  if (!selection) return;
+  if (!selection.protected) {restoreDocument(selection.json);return;}
+  const password=input('password','',{type:'password',required:true,maxLength:128,autocomplete:'off',spellcheck:false});
+  const message=el('p','','danger');
+  message.setAttribute('role','status');
+  show('Открыть резервную копию',form(async ()=>{
+    message.textContent='';
+    try {
+      const opening=native('unlockBackup',{password:password.value});
+      password.value='';
+      restoreDocument(await opening);
+    } catch(error) { message.textContent=error.message; }
+  },'Проверить пароль',label('Пароль копии',password),message));
 }
 function backupsPage() {
-  const pick=input('backup','',{type:'file',accept:'.json,application/json'});
-  pick.onchange=async ()=>{
-    const file=pick.files[0];
-    if (!file) return;
-    pick.value='';
-    try {
-      requireThat(file.size<=25000000,'Выберите JSON-копию размером до 25 МБ.');
-      let parsed;
-      try {parsed=JSON.parse(await file.text());}
-      catch {throw new Error('Не удалось прочитать JSON. Выберите файл резервной копии.');}
-      const imported=restore(parsed);
-      confirm('Восстановить записи?',
-        'Файл заменит местные записи. В копии визитов: '+imported.visits.length+', клиентов: '+imported.clients.length+'.',async ()=>{
-          await pendingDraft.catch(()=>{});
-          await write(()=>imported);
-          draft=blankVisit();
-          dialog.close();
-          render();
-          notify('Записи восстановлены.');
-        },'Восстановить');
-    } catch(error) {notify(error.message);}
-  };
   return box('section','',el('h1','Резервная копия'),panel(
-    dim('Сохраните JSON в приложении «Файлы». По этой копии можно восстановить клиентов, визиты, закупки и цены на другом телефоне.'),
-    b('Сохранить копию в Файлы',saveFile,'primary'),label('Восстановить из файла',pick)),
-    panel(el('h2','Переезд из Google Таблицы'),dim('Если там уже есть записи, скачайте JSON в настройках прежнего кабинета и выберите его здесь.')));
+    dim('Сохраните защищённый файл в «Файлы» вне телефона. Копии .kolorist можно переносить между Android и iPhone. Старые JSON тоже открываются.'),
+    b('Создать копию с паролем',exportBackup,'primary'),b('Восстановить из файла',importBackup)));
+}
+function applyPreferences() {
+  cabinetZone=state.preferences.zone;
+  document.documentElement.dataset.theme=state.preferences.theme;
+  $('brand-name').textContent=state.preferences.name;
+}
+function settingsPage() {
+  const p=state.preferences;
+  const theme=choose('theme',p.theme,[['system','Как на телефоне'],['light','Светлая'],['dark','Тёмная']]);
+  const timeZones=new Map([['Asia/Yakutsk','Якутск'],['Europe/Moscow','Москва'],
+    ['Asia/Vladivostok','Владивосток'],['Asia/Irkutsk','Иркутск'],['Asia/Novosibirsk','Новосибирск'],
+    ['Asia/Yekaterinburg','Екатеринбург'],['Europe/Kaliningrad','Калининград']]);
+  const phoneZone=new Intl.DateTimeFormat().resolvedOptions().timeZone;
+  if (phoneZone && !timeZones.has(phoneZone)) timeZones.set(phoneZone,'Как на телефоне ('+phoneZone+')');
+  if (!timeZones.has(p.zone)) timeZones.set(p.zone,p.zone);
+  const openMaterials=input('expandMaterials','on',{type:'checkbox',checked:p.expandMaterials});
+  const openRecipe=input('expandRecipe','on',{type:'checkbox',checked:p.expandRecipe});
+  return box('section','',el('h1','Настройки'),panel(form(async fields=>{
+    const preferences=preferencesFrom({...p,...fields,expandMaterials:openMaterials.checked,expandRecipe:openRecipe.checked,
+      defaultAmount:fields.amount,defaultType:fields.type,defaultTarget:fields.target});
+    const idle=!hasDraft();
+    await flushDraft().catch(()=>{});
+    await write(data=>({...data,preferences}),idle);
+    applyPreferences();
+    reportDate=today();
+    if (idle) draft=freshDraft();
+    notify('Настройки сохранены.');
+  },'Сохранить',label('Название кабинета',input('name',p.name,{maxLength:60,required:true})),
+    label('Часовой пояс',choose('zone',p.zone,timeZones)),label('Тема',theme),
+    ...Object.entries(stepKeys).map(([unit,key])=>label('Шаг +/−, '+unit,input(key,p[key],{inputMode:'decimal',required:true}))),
+    el('h2','Скидка по умолчанию'),discountFields({amount:p.defaultAmount,type:p.defaultType,target:p.defaultTarget}),
+    label('Раскрывать расходники в новом визите',openMaterials),label('Раскрывать формулу в новом визите',openRecipe))));
+}
+function tour(step=0) {
+  const steps=[
+    ['Запишите визит','Укажите стоимость работы и точное количество материалов. Например, 8,5 г можно ввести вручную.'],
+    ['Сохраните формулу','В карточке клиента хранятся контакты, скидка и история окрашиваний.'],
+    ['Сверьте итоги','В «Итогах» видны касса, фонд закупки и чистый заработок. Создать копию с паролем можно в разделе «Ещё».']
+  ];
+  const done=async()=>{await native('finishTour');dialog.close();};
+  const [title,caption]=steps[step];
+  show(title,dim(caption),actions(b('Пропустить',done),b(step+1===steps.length?'Начать': 'Далее',
+    ()=>step+1===steps.length?done():tour(step+1),'primary')));
 }
 function morePage() {
   return box('section','',el('h1','Ещё'),panel(
     b('Закупки',()=>jump('purchases')),b('Расходники и цены',()=>jump('materials')),
-    b('Резервная копия',()=>jump('backup'))),
-    panel(el('h2','Работа на iPhone'),dim('Откройте ссылку в Safari, нажмите «Поделиться → На экран Домой». Затем откройте иконку с интернетом один раз.'),
-      dim('Записи остаются в памяти этого устройства. Часовой пояс — Якутск.')));
+    b('Настройки',()=>jump('settings')),b('Резервная копия',()=>jump('backup')),b('Посмотреть обучение',()=>tour()),
+    ...(!inAPK && !matchMedia('(display-mode: standalone)').matches && !navigator.standalone?
+      [b('Установить на телефон',installApp)]:[])),
+    dim('Записи остаются на этом устройстве. Часовой пояс: '+state.preferences.zone+'.'));
 }
-const views={visit:visitPage,clients:clientsPage,report:reportPage,more:morePage,purchases:purchasesPage,materials:materialsPage,backup:backupsPage};
+const views={visit:visitPage,clients:clientsPage,report:reportPage,more:morePage,purchases:purchasesPage,materials:materialsPage,backup:backupsPage,settings:settingsPage};
 function render() {
+  const dock=$('visit-dock');
+  dock.replaceChildren();
+  dock.hidden=true;
   const back=Object.hasOwn(views,tab)&&!['visit','clients','report','more'].includes(tab);
   root.replaceChildren(...(back?[box('div','head',b('К разделу «Ещё»',()=>jump('more')))]:[]),views[tab]());
   for (const button of $('tabs').querySelectorAll('button')) {
@@ -523,27 +657,23 @@ function render() {
     else button.removeAttribute('aria-current');
   }
 }
-function offlineStatus(text) { $('offline').textContent=text; }
-async function activateOffline() {
-  if (!('serviceWorker' in navigator)) return;
-  try {
-    const registration=await navigator.serviceWorker.register('./sw.js',{updateViaCache:'none'});
-    await navigator.serviceWorker.ready;
-    registration.update().catch(()=>{});
-    offlineStatus('Готово к работе офлайн');
-    if (window.matchMedia('(display-mode: standalone)').matches) navigator.storage?.persist?.().catch(()=>{});
-  } catch {
-    offlineStatus('Записи на устройстве');
-  }
-}
 $('close').onclick=()=>dialog.close();
 for (const button of $('tabs').querySelectorAll('button')) button.onclick=()=>jump(button.dataset.tab);
 async function openCabinet() {
   state=await read();
-  draft=state.draft||blankVisit();
+  applyPreferences();
+  reportDate=today();
+  draft=state.draft||freshDraft();
+  const storedVisit=state.visits.find(row=>row.id===draft.id);
+  if (draft.editing===true) {
+    draft=storedVisit?{...draft,editing:storedVisit.created,baseRevision:storedVisit.revision??1}:freshDraft();
+  } else if (draft.editing && (!storedVisit || (storedVisit.revision??1)!==(draft.baseRevision??1))) {
+    draft=freshDraft();
+  } else if (!draft.editing && storedVisit) draft=freshDraft();
   render();
   $('tabs').hidden=false;
   root.setAttribute('aria-busy','false');
+  if (!await native('tourDone')) tour();
 }
 
 function showActivation() {
@@ -554,32 +684,71 @@ function showActivation() {
   const unlock=form(async fields=>{
     message.textContent='';
     try {
-      if (!await matchesCode(fields.code)) {
-        message.textContent='Код не подошёл. Проверьте символы и попробуйте снова.';
+      if (!await native('activate',{code:fields.code})) {
+        message.textContent='Код не подошёл. Проверьте буквы и цифры.';
         code.focus();
         return;
       }
-      await rememberActivation();
+      code.value='';
       await openCabinet();
     } catch(error) {
       message.textContent=error.message||'Не удалось открыть кабинет.';
     }
   },'Открыть кабинет',label('Код установки',code),message);
   code.oninput=()=>{message.textContent='';};
-  const help=details('Как добавить на iPhone',box('div','stack',
-    dim('Откройте ссылку в Safari. Нажмите «Поделиться → На экран Домой → Добавить».'),
-    dim('Откройте новую иконку и введите код уже там.')));
   root.replaceChildren(box('section','activation',el('h1','Открыть кабинет'),
-    dim('Введите код, который вам передали. На этом устройстве его нужно ввести один раз.'),
-    panel(unlock),help));
+    dim('Введите прежний код установки. На этом устройстве его нужно ввести один раз.'),panel(unlock)));
   root.setAttribute('aria-busy','false');
 }
 
-try {
-  if (await isActivated()) await openCabinet();
-  else showActivation();
-  activateOffline();
-} catch {
-  root.replaceChildren(panel(el('h1','Память недоступна'),dim('Откройте кабинет в обычном окне Safari и попробуйте снова.')));
-  root.setAttribute('aria-busy','false');
+function updateKeyboardLayout() {
+  const viewport=window.visualViewport;
+  const field=document.activeElement;
+  document.body.classList.toggle('keyboard',Boolean(viewport && /^(INPUT|TEXTAREA)$/.test(field?.tagName)
+    && window.innerHeight-viewport.height>110));
 }
+window.visualViewport?.addEventListener('resize',updateKeyboardLayout);
+document.addEventListener('focusin',updateKeyboardLayout);
+document.addEventListener('focusout',()=>setTimeout(updateKeyboardLayout,0));
+
+window.addEventListener('beforeinstallprompt',event=>{
+  event.preventDefault();
+  installPrompt=event;
+});
+async function installApp() {
+  if (installPrompt) {
+    const prompt=installPrompt;
+    installPrompt=null;
+    await prompt.prompt();
+    return;
+  }
+  show('Установить на экран телефона',
+    el('p','iPhone: откройте ссылку в Safari. Нажмите «Поделиться», затем «На экран Домой». Если есть переключатель «Открывать как веб-приложение», включите его.'),
+    el('p','Android: откройте ссылку в Chrome. Нажмите ⋮, затем «Установить приложение» или «Добавить на главный экран».'));
+}
+async function enableOffline() {
+  if (inAPK) {$('offline').textContent='Готово офлайн';return;}
+  if (!('serviceWorker' in navigator)) return;
+  const oldController=navigator.serviceWorker.controller;
+  navigator.serviceWorker.addEventListener('controllerchange',()=>{
+    if (oldController) notify('Обновление готово. Закройте и откройте кабинет после сохранения визита.');
+  });
+  try {
+    const registration=await navigator.serviceWorker.register('./sw.js',{updateViaCache:'none'});
+    await navigator.serviceWorker.ready;
+    $('offline').textContent='Готово офлайн';
+    registration.update().catch(()=>{});
+    if (matchMedia('(display-mode: standalone)').matches || navigator.standalone) navigator.storage?.persist?.().catch(()=>{});
+  } catch {$('offline').textContent='Данные на устройстве';}
+}
+enableOffline();
+
+(async ()=>{
+  try {
+    if (await native('isActivated')) await openCabinet();
+    else showActivation();
+  } catch {
+    root.replaceChildren(panel(el('h1','Память недоступна'),dim('Закройте приложение и откройте его снова.')));
+    root.setAttribute('aria-busy','false');
+  }
+})();

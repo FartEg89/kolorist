@@ -39,3 +39,33 @@ dialog::backdrop{background:#26152294}dialog header{display:flex;align-items:cen
 .activation{max-width:460px;margin:clamp(12px,8vh,76px) auto 0}
 .activation [role=status]:empty{display:none}
 .activation input{letter-spacing:.08em}
+:root[data-theme=light]{color-scheme:light;--bg:#faf7f5;--surface:#fffdfc;--ink:#2c222b;--sub:#625563;--line:#ddd2db;--accent:#6a365b;--on:#fff;--tint:#f1e5ed;--danger:#9c233a;--shadow:0 12px 38px #37162f12}
+:root[data-theme=dark]{color-scheme:dark;--bg:#1c181e;--surface:#261f28;--ink:#f5eaf2;--sub:#d6c6d2;--line:#534351;--accent:#ecb9dd;--on:#35192e;--tint:#352736;--danger:#ffacba;--shadow:0 12px 38px #171019aa}
+main,.mast{padding-left:max(16px,env(safe-area-inset-left));padding-right:max(16px,env(safe-area-inset-right))}
+nav{grid-template-columns:repeat(4,minmax(0,1fr))}
+nav button,.record>*,.row>*{min-width:0;overflow-wrap:anywhere}
+summary{overflow-wrap:anywhere}
+section,form,.stack{min-width:0}
+body.keyboard nav,body.native-keyboard nav{display:none}
+body.keyboard .bill,body.native-keyboard .bill{position:static}
+dialog p[role=status]:empty{display:none}
+@media(max-width:345px){:root{--nav:calc(119px + var(--safe))}nav{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-height:500px) and (orientation:landscape){.bill{position:static}:root{--nav:calc(65px + var(--safe))}nav{grid-template-columns:repeat(4,minmax(0,1fr))}}
+.actions>*{flex:1 1 145px;min-width:0;overflow-wrap:anywhere}
+
+.record{content-visibility:auto;contain-intrinsic-size:auto 115px}
+
+/* Прокручивается рабочая область. Нижние кнопки занимают собственное место. */
+body{height:100vh;height:100dvh;display:grid;grid-template-rows:auto minmax(0,1fr) auto auto;overflow:hidden}
+main,.mast{width:100%;margin:0 auto}
+main{overflow-y:auto;overscroll-behavior-y:contain;padding-bottom:22px;scroll-padding-block:12px}
+nav{position:static;transform:none;margin:auto}
+#visit-dock{width:min(100%,640px);margin:auto;padding:5px max(12px,env(safe-area-inset-right)) 5px max(12px,env(safe-area-inset-left))}
+.bill{position:static}
+body.keyboard #visit-dock,body.native-keyboard #visit-dock{display:none}
+@media(max-height:500px) and (orientation:landscape){
+  .mast{padding-top:6px;padding-bottom:6px}
+  .mast .brand img{height:28px;width:28px}
+  .bill{padding:5px 9px;gap:2px}
+  .bill .amount{font-size:1.25rem}
+}
