@@ -71,6 +71,38 @@ async function dbAction(mode, operation) {
 const getDB=key=>dbAction('readonly',(_store,get,done)=>get(key,done));
 const putDB=(key,value)=>dbAction('readwrite',(store)=>store.put(value,key));
 
+const BACKUP_REMINDER_KEY='backup-reminder-at';
+const BACKUP_REMINDER_INTERVAL=3*24*60*60*1000;
+
+function backupReminderPlan(next,now,hasRecords) {
+  if (!Number.isSafeInteger(next) || next<=0 || next>now+BACKUP_REMINDER_INTERVAL) {
+    return {next:now+BACKUP_REMINDER_INTERVAL,show:false};
+  }
+  return next<=now && hasRecords
+    ? {next:now+BACKUP_REMINDER_INTERVAL,show:true}
+    : {next,show:false};
+}
+
+async function claimBackupReminder(hasRecords) {
+  const now=Date.now();
+  if (inAPK) {
+    const next=await androidCall('getBackupReminder',{});
+    const plan=backupReminderPlan(next,now,hasRecords);
+    if (plan.next!==next) await androidCall('setBackupReminder',{next:plan.next});
+    return plan.show;
+  }
+  return dbAction('readwrite',(store,get,done)=>get(BACKUP_REMINDER_KEY,next=>{
+    const plan=backupReminderPlan(next,now,hasRecords);
+    if (plan.next!==next) store.put(plan.next,BACKUP_REMINDER_KEY);
+    done(plan.show);
+  }));
+}
+
+function postponeBackupReminder() {
+  const next=Date.now()+BACKUP_REMINDER_INTERVAL;
+  return inAPK ? androidCall('setBackupReminder',{next}) : putDB(BACKUP_REMINDER_KEY,next);
+}
+
 function readPickedFile() {
   return new Promise((resolve,reject)=>{
     const input=document.createElement('input');

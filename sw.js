@@ -1,5 +1,5 @@
-const VERSION='kolorist-2.0.0';
-const files=['./','./style.css?v=2.0.0','./model.js?v=2.0.0','./backup.js?v=2.0.0','./cabinet.js?v=2.0.0','./app.js?v=2.0.0','./manifest.webmanifest','./icon-192.png','./icon-512.png'];
+const VERSION='kolorist-2.0.1';
+const files=['./','./style.css?v=2.0.1','./model.js?v=2.0.1','./backup.js?v=2.0.1','./cabinet.js?v=2.0.1','./app.js?v=2.0.1','./manifest.webmanifest','./icon-192.png','./icon-512.png'];
 const urls=new Set(files.map(file=>new URL(file,self.registration.scope).href));
 const scopeKey=new URL(self.registration.scope).pathname;
 const cacheName=VERSION+scopeKey;

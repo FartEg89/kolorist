@@ -535,6 +535,29 @@ function restoreDocument(json) {
       notify('Записи восстановлены.');
     },'Восстановить');
 }
+let checkingBackupReminder=false;
+
+async function checkBackupReminder() {
+  if (!state || dialog.open || checkingBackupReminder || document.visibilityState==='hidden') return;
+  checkingBackupReminder=true;
+  try {
+    const hasRecords=Boolean(state.visits.length || state.clients.length || state.purchases.length || state.revised);
+    if (await claimBackupReminder(hasRecords) && !dialog.open && document.visibilityState!=='hidden') {
+      show('Пора создать резервную копию',
+        dim('Сохраните зашифрованную копию вне телефона, чтобы вернуть записи после очистки или потери устройства.'),
+        actions(b('Через три дня',()=>dialog.close()),b('Создать копию',exportBackup,'primary')));
+    }
+  } catch(error) {
+    // Если отметку не удалось сохранить, кабинет остаётся доступен.
+  } finally {checkingBackupReminder=false;}
+}
+
+async function confirmBackupSaved() {
+  await postponeBackupReminder().catch(()=>{});
+  dialog.close();
+  notify('Защищённая копия сохранена.');
+}
+
 function exportBackup() {
   const field=()=>input('password','',{type:'password',minLength:8,maxLength:128,required:true,autocomplete:'off',spellcheck:false});
   const first=field(),second=field();
@@ -550,7 +573,7 @@ function exportBackup() {
       first.value=second.value='';
       const archive=await saving;
       if (!archive) return;
-      if (inAPK) {dialog.close();notify('Защищённая копия сохранена.');return;}
+      if (inAPK) {await confirmBackupSaved();return;}
       show('Копия готова',dim('Сохраните зашифрованный файл вне этого устройства.'),
         b('Сохранить файл',()=>downloadArchive(archive),'primary'));
     } catch(error) {message.textContent=error.message;}
@@ -559,7 +582,7 @@ function exportBackup() {
 }
 async function downloadArchive(archive) {
   if (navigator.canShare?.({files:[archive]})) {
-    try {await navigator.share({files:[archive]});dialog.close();return;}
+    try {await navigator.share({files:[archive]});askWhetherBackupWasSaved();return;}
     catch(error) {if (error.name==='AbortError') return;}
   }
   const url=URL.createObjectURL(archive);
@@ -570,8 +593,12 @@ async function downloadArchive(archive) {
   link.click();
   link.remove();
   setTimeout(()=>URL.revokeObjectURL(url),30000);
-  dialog.close();
-  notify('Проверьте файл в папке загрузок.');
+  askWhetherBackupWasSaved();
+}
+function askWhetherBackupWasSaved() {
+  show('Копия сохранилась?',
+    dim('Проверьте, что файл .kolorist появился в выбранном месте. Если он в загрузках телефона, перенесите его в облако или на компьютер.'),
+    actions(b('Позже',()=>dialog.close()),b('Файл сохранён',confirmBackupSaved,'primary')));
 }
 async function importBackup() {
   const selection=await native('openBackup');
@@ -632,7 +659,7 @@ function tour(step=0) {
     ['Сохраните формулу','В карточке клиента хранятся контакты, скидка и история окрашиваний.'],
     ['Сверьте итоги','В «Итогах» видны касса, фонд закупки и чистый заработок. Создать копию с паролем можно в разделе «Ещё».']
   ];
-  const done=async()=>{await native('finishTour');dialog.close();};
+  const done=async()=>{await native('finishTour');dialog.close();void checkBackupReminder();};
   const [title,caption]=steps[step];
   show(title,dim(caption),actions(b('Пропустить',done),b(step+1===steps.length?'Начать': 'Далее',
     ()=>step+1===steps.length?done():tour(step+1),'primary')));
@@ -674,7 +701,11 @@ async function openCabinet() {
   $('tabs').hidden=false;
   root.setAttribute('aria-busy','false');
   if (!await native('tourDone')) tour();
+  else void checkBackupReminder();
 }
+
+window.addEventListener('focus',()=>void checkBackupReminder());
+document.addEventListener('visibilitychange',()=>void checkBackupReminder());
 
 function showActivation() {
   const code=input('code','',{type:'password',required:true,maxLength:28,autocapitalize:'characters',
